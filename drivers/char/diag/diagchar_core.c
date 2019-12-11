@@ -171,6 +171,7 @@ uint16_t diag_debug_mask;
 void *diag_ipc_log;
 #endif
 
+extern uint16_t md_support;
 static void diag_md_session_close(struct diag_md_session_t *session_info);
 
 /*
@@ -439,8 +440,10 @@ static void diag_close_logging_process(const int pid)
 	driver->mask_clear = 1;
 	mutex_unlock(&driver->diag_maskclear_mutex);
 
+	mutex_lock(&driver->diagchar_mutex);
 	session_peripheral_mask = session_info->peripheral_mask;
 	diag_md_session_close(session_info);
+	mutex_unlock(&driver->diagchar_mutex);
 	for (i = 0; i < NUM_MD_SESSIONS; i++)
 		if (MD_PERIPHERAL_MASK(i) & session_peripheral_mask)
 			diag_mux_close_peripheral(DIAG_LOCAL_PROC, i);
@@ -515,8 +518,8 @@ static int diag_remove_client_entry(struct file *file)
 static int diagchar_close(struct inode *inode, struct file *file)
 {
 	int ret;
-	DIAG_LOG(DIAG_DEBUG_USERSPACE, "diag: process exit %s\n",
-		current->comm);
+	DIAG_LOG(DIAG_DEBUG_USERSPACE, "diag: %s process exit with pid = %d\n",
+		current->comm, current->tgid);
 	ret = diag_remove_client_entry(file);
 	mutex_lock(&driver->diag_maskclear_mutex);
 	driver->mask_clear = 0;
@@ -606,8 +609,9 @@ int diag_cmd_chk_polling(struct diag_cmd_reg_entry_t *entry)
 {
 	int polling = DIAG_CMD_NOT_POLLING;
 
-	if (!entry)
+	if (!entry) {
 		return -EIO;
+	}
 
 	if (entry->cmd_code == DIAG_CMD_NO_SUBSYS) {
 		if (entry->subsys_id == DIAG_CMD_NO_SUBSYS &&
@@ -641,10 +645,12 @@ static void diag_cmd_invalidate_polling(int change_flag)
 	struct list_head *start;
 	struct list_head *temp;
 	struct diag_cmd_reg_t *item = NULL;
-
 	if (change_flag == DIAG_CMD_ADD) {
-		if (driver->polling_reg_flag)
+		if (driver->polling_reg_flag) {
+			DIAG_LOG(DIAG_DEBUG_PERIPHERALS,
+				" exiting function %s", __func__);
 			return;
+		}
 	}
 
 	driver->polling_reg_flag = 0;
@@ -1943,6 +1949,15 @@ static int diag_ioctl_hdlc_toggle(unsigned long ioarg)
 	return 0;
 }
 
+static int diag_ioctl_md_support_list(unsigned long ioarg)
+{
+	if (copy_to_user((void __user *)ioarg, &md_support,
+			sizeof(md_support)))
+		return -EFAULT;
+	else
+		return 0;
+}
+
 static int diag_ioctl_register_callback(unsigned long ioarg)
 {
 	int err = 0;
@@ -2182,6 +2197,9 @@ long diagchar_compat_ioctl(struct file *filp,
 	case DIAG_IOCTL_HDLC_TOGGLE:
 		result = diag_ioctl_hdlc_toggle(ioarg);
 		break;
+	case DIAG_IOCTL_MD_SUPPORT_LIST:
+		result = diag_ioctl_md_support_list(ioarg);
+		break;
 	}
 	return result;
 }
@@ -2306,6 +2324,9 @@ long diagchar_ioctl(struct file *filp,
 		break;
 	case DIAG_IOCTL_HDLC_TOGGLE:
 		result = diag_ioctl_hdlc_toggle(ioarg);
+		break;
+	case DIAG_IOCTL_MD_SUPPORT_LIST:
+		result = diag_ioctl_md_support_list(ioarg);
 		break;
 	}
 	return result;
@@ -2849,6 +2870,8 @@ static ssize_t diagchar_read(struct file *file, char __user *buf, size_t count,
 	int exit_stat = 0;
 	int write_len = 0;
 	struct diag_md_session_t *session_info = NULL;
+	struct pid *pid_struct = NULL;
+	struct task_struct *task_s = NULL;
 
 	mutex_lock(&driver->diagchar_mutex);
 	for (i = 0; i < driver->num_clients; i++)
@@ -3009,8 +3032,19 @@ exit:
 		list_for_each_safe(start, temp, &driver->dci_client_list) {
 			entry = list_entry(start, struct diag_dci_client_tbl,
 									track);
-			if (entry->client->tgid != current->tgid)
+			pid_struct = find_get_pid(entry->tgid);
+			if (!pid_struct)
 				continue;
+			task_s = get_pid_task(pid_struct, PIDTYPE_PID);
+			if (!task_s) {
+				DIAG_LOG(DIAG_DEBUG_DCI,
+				"diag: valid task doesn't exist for pid = %d\n",
+				entry->tgid);
+				continue;
+			}
+			if (task_s == entry->client)
+				if (entry->client->tgid != current->tgid)
+					continue;
 			if (!entry->in_service)
 				continue;
 			if (copy_to_user(buf + ret, &data_type, sizeof(int))) {
